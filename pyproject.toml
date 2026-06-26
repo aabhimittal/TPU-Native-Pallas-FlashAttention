@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pallas-flash"
+version = "0.1.0"
+description = "A from-scratch FlashAttention kernel in JAX Pallas for TPU v3-8, wired into a tiny LLaMA decoder."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "jax>=0.4.30",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# Install jax with TPU support on Kaggle / Cloud TPU:
+#   pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+tpu = ["jax[tpu]"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
