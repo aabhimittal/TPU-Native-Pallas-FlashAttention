@@ -1,0 +1,8 @@
+# Core dependencies. For local/CPU testing this is all you need:
+#   pip install -r requirements.txt
+jax>=0.4.30
+numpy
+pytest
+
+# On Kaggle / Cloud TPU v3-8, install the TPU build of JAX instead of the line above:
+#   pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
