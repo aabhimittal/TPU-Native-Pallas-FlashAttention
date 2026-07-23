@@ -19,12 +19,13 @@ and peak memory grow roughly **linearly**. The speedup widens as `seq_len` grows
 
 | Path | What it is |
 |------|------------|
-| `src/pallas_flash/flash_attention.py` | The Pallas kernel + `flash_attention()` wrapper (the core deliverable) |
+| `src/pallas_flash/flash_attention.py` | The Pallas kernel + `flash_attention()` wrapper (MHA / GQA / MQA) |
 | `src/pallas_flash/reference.py` | Naive `jnp` attention — correctness oracle **and** XLA baseline |
-| `src/pallas_flash/model.py` | Tiny LLaMA: RMSNorm, RoPE, SwiGLU, decoder block, `generate()` |
-| `src/pallas_flash/config.py` | `ModelConfig` dataclass |
+| `src/pallas_flash/model.py` | Tiny LLaMA: RMSNorm, RoPE, SwiGLU, decoder block, `generate()`, KV-cache `generate_cached()` |
+| `src/pallas_flash/config.py` | `ModelConfig` dataclass (incl. `n_kv_heads` for GQA) |
 | `tests/` | `interpret=True` correctness + model smoke tests (run on CPU) |
-| `benchmarks/benchmark_attention.py` | Pallas vs XLA timing table |
+| `benchmarks/benchmark_attention.py` | Pallas vs XLA attention timing table |
+| `benchmarks/benchmark_decode.py` | KV-cache vs full-recompute decoding timing table |
 | `scripts/run_inference.py` | End-to-end tiny-LLaMA greedy generation demo |
 | `notebooks/kaggle_tpu_flash_attention.ipynb` | Self-contained Kaggle TPU v3-8 notebook |
 
@@ -43,6 +44,10 @@ sequentially in lexicographic order.
    a full softmax, but the `[seq, seq]` matrix never exists.
 3. **Causal block skipping.** With `causal=True`, key blocks entirely in the
    future of a query block are skipped — no load, no matmul.
+4. **Grouped-query attention (GQA/MQA).** `k`/`v` may have fewer heads than `q`
+   (`num_heads` a multiple of `num_kv_heads`). Query head `h` reads KV head
+   `h // (num_heads // num_kv_heads)` — expressed purely in the K/V `BlockSpec`
+   index map, so the KV cache is never physically replicated.
 
 The *same* source runs on CPU via `interpret=True` (used by the tests) and
 compiles to TPU with `interpret=False`.
@@ -86,13 +91,32 @@ Run it **on a TPU** for meaningful numbers — on CPU (interpret mode) the kerne
 is intentionally un-optimized and only confirms the code path executes. On a
 v3-8 the Pallas kernel pulls ahead of the XLA baseline as `seq_len` increases.
 
+## KV-cache decoding
+
+`generate()` re-runs the whole prefix every step (O(T²) work to emit T tokens).
+`generate_cached()` keeps a per-layer K/V cache and reuses the *same* Pallas
+kernel — the prompt is processed once with `causal=True` (prefill), then each new
+token attends its single query against the cache with `causal=False`:
+
+```python
+from pallas_flash import ModelConfig, init_params, generate_cached
+cfg = ModelConfig(n_heads=4, n_kv_heads=2, dim=512)   # grouped-query attention
+params = init_params(jax.random.PRNGKey(0), cfg)
+tokens = generate_cached(params, prompt_ids, max_new_tokens=32, cfg=cfg)
+```
+
+`generate_cached` produces the **exact same tokens** as `generate` (verified in
+the test-suite) while doing far less work per step. Benchmark it with
+`python benchmarks/benchmark_decode.py`.
+
 ## Notes & non-goals
 
 - **Untrained model** — parameters are random; the LLaMA exists to exercise the
   kernel on a realistic inference path, not to produce meaningful text.
 - **Forward only** — no attention backward pass (inference focus).
-- **KV cache** — `generate()` recomputes the prefix each step for clarity; a
-  cached single-query decode kernel is the natural next step.
+- **KV cache** — implemented via `generate_cached()`, which reuses the forward
+  kernel (single-query attention against the cache). A dedicated single-query
+  *decode kernel* with a fixed-size ring-buffer cache is a further optimization.
 - **Fully manual DMA** — `BlockSpec` already pipelines HBM↔VMEM copies; for
   hand-rolled control you can keep K/V in `pltpu.ANY` and drive
   `pltpu.make_async_copy` yourself (sketched in the notebook's notes).

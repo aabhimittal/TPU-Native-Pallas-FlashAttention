@@ -29,8 +29,13 @@ def reference_attention(
 ) -> jax.Array:
     """Standard scaled dot-product attention.
 
+    Supports grouped-query / multi-query attention: if ``k``/``v`` have fewer
+    heads than ``q`` (``num_heads`` a multiple of ``num_kv_heads``), the KV heads
+    are repeated to match, mirroring the kernel's head grouping.
+
     Args:
-        q, k, v: arrays of shape ``[batch, num_heads, seq_len, head_dim]``.
+        q: array of shape ``[batch, num_heads, seq_len_q, head_dim]``.
+        k, v: arrays of shape ``[batch, num_kv_heads, seq_len_k, head_dim]``.
         causal: apply a causal (lower-triangular) mask if ``True``.
         sm_scale: softmax scale; defaults to ``1 / sqrt(head_dim)``.
 
@@ -40,6 +45,12 @@ def reference_attention(
     head_dim = q.shape[-1]
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim ** 0.5)
+
+    num_heads, num_kv_heads = q.shape[1], k.shape[1]
+    if num_kv_heads != num_heads:
+        q_per_kv = num_heads // num_kv_heads
+        k = jnp.repeat(k, q_per_kv, axis=1)
+        v = jnp.repeat(v, q_per_kv, axis=1)
 
     scores = jnp.einsum("bhqd,bhkd->bhqk", q, k).astype(jnp.float32) * sm_scale
 
