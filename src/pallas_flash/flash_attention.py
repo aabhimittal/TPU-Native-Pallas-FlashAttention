@@ -153,10 +153,22 @@ def flash_attention(
 ) -> jax.Array:
     """Compute FlashAttention with a custom Pallas TPU kernel.
 
+    Supports multi-head attention (MHA) as well as **grouped-query attention**
+    (GQA) and multi-query attention (MQA): ``k``/``v`` may have fewer heads than
+    ``q`` as long as ``num_heads`` is a multiple of ``num_kv_heads``. Each query
+    head ``h`` reads from key/value head ``h // (num_heads // num_kv_heads)`` —
+    the grouping is expressed purely through the K/V ``BlockSpec`` index map, so
+    the KV cache is never physically replicated.
+
     Args:
-        q, k, v: arrays of shape ``[batch, num_heads, seq_len, head_dim]``.
-            ``q`` may have a different sequence length than ``k``/``v``.
-        causal: if ``True``, apply a causal (lower-triangular) mask.
+        q: array of shape ``[batch, num_heads, seq_len_q, head_dim]``.
+        k, v: arrays of shape ``[batch, num_kv_heads, seq_len_k, head_dim]``,
+            where ``num_kv_heads`` divides ``num_heads``. For plain MHA,
+            ``num_kv_heads == num_heads``. ``seq_len_k`` may differ from
+            ``seq_len_q``.
+        causal: if ``True``, apply a causal (lower-triangular) mask. Only
+            meaningful when the query and key sequences are aligned from
+            position 0 (e.g. self-attention or a causal prefill).
         sm_scale: softmax scale; defaults to ``1 / sqrt(head_dim)``.
         block_q: query block size (rows loaded into VMEM at a time).
         block_k: key/value block size.
@@ -171,11 +183,18 @@ def flash_attention(
         raise ValueError("q, k, v must be rank-4 [batch, heads, seq, head_dim] arrays")
 
     batch, num_heads, seq_len_q, head_dim = q.shape
+    num_kv_heads = k.shape[1]
     seq_len_k = k.shape[2]
     if k.shape != v.shape:
         raise ValueError("k and v must have the same shape")
-    if k.shape[0] != batch or k.shape[1] != num_heads or k.shape[3] != head_dim:
-        raise ValueError("q and k/v must share batch, heads and head_dim")
+    if k.shape[0] != batch or k.shape[3] != head_dim:
+        raise ValueError("q and k/v must share batch and head_dim")
+    if num_kv_heads == 0 or num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be a multiple of num_kv_heads "
+            f"({num_kv_heads}) for grouped-query attention"
+        )
+    q_per_kv = num_heads // num_kv_heads
 
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim ** 0.5)
@@ -189,9 +208,12 @@ def flash_attention(
     # array to stream into VMEM. This explicit mapping is the manual control
     # over data movement that the project is about.
     #   q/o block index: (batch, head, q_block, 0)   -> depends on q_block only
-    #   k/v block index: (batch, head, kv_block, 0)  -> depends on kv_block only
+    #   k/v block index: (batch, head // q_per_kv, kv_block, 0)
+    #       -> maps each query head to its shared key/value head (GQA/MQA).
     q_spec = pl.BlockSpec((1, 1, block_q, head_dim), lambda b, h, i, j: (b, h, i, 0))
-    k_spec = pl.BlockSpec((1, 1, block_k, head_dim), lambda b, h, i, j: (b, h, j, 0))
+    k_spec = pl.BlockSpec(
+        (1, 1, block_k, head_dim), lambda b, h, i, j: (b, h // q_per_kv, j, 0)
+    )
     v_spec = k_spec
     o_spec = pl.BlockSpec((1, 1, block_q, head_dim), lambda b, h, i, j: (b, h, i, 0))
 

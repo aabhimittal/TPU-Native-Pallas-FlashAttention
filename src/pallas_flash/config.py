@@ -17,7 +17,11 @@ class ModelConfig:
     vocab_size: int = 256
     dim: int = 256          # model / embedding dimension
     n_layers: int = 4
-    n_heads: int = 2
+    n_heads: int = 2        # number of query heads
+    # Number of key/value heads. If < n_heads (and dividing it) the model uses
+    # grouped-query attention (GQA); n_kv_heads == 1 is multi-query attention
+    # (MQA). Defaults to n_heads (plain multi-head attention) when left as 0.
+    n_kv_heads: int = 0
     # head_dim is fixed at 128 so the attention block tiling lands on the TPU's
     # native (8, 128) vector-register shape; dim must equal n_heads * head_dim.
     head_dim: int = 128
@@ -32,8 +36,20 @@ class ModelConfig:
     block_k: int = 128
 
     def __post_init__(self) -> None:
+        if self.n_kv_heads == 0:
+            object.__setattr__(self, "n_kv_heads", self.n_heads)
         if self.dim != self.n_heads * self.head_dim:
             raise ValueError(
                 f"dim ({self.dim}) must equal n_heads * head_dim "
                 f"({self.n_heads} * {self.head_dim} = {self.n_heads * self.head_dim})"
             )
+        if self.n_kv_heads <= 0 or self.n_heads % self.n_kv_heads != 0:
+            raise ValueError(
+                f"n_heads ({self.n_heads}) must be a multiple of n_kv_heads "
+                f"({self.n_kv_heads})"
+            )
+
+    @property
+    def kv_dim(self) -> int:
+        """Total width of the key/value projections."""
+        return self.n_kv_heads * self.head_dim

@@ -2,17 +2,19 @@
 
 import jax
 import jax.numpy as jnp
+import pytest
 
-from pallas_flash import ModelConfig, init_params, forward, generate
+from pallas_flash import ModelConfig, init_params, forward, generate, generate_cached
 from pallas_flash.model import decoder_block, precompute_rope
 
 
-def _tiny_cfg():
+def _tiny_cfg(n_heads=2, n_kv_heads=0):
     return ModelConfig(
         vocab_size=64,
-        dim=256,
+        dim=n_heads * 128,
         n_layers=2,
-        n_heads=2,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
         head_dim=128,
         ffn_hidden=512,
         max_seq_len=256,
@@ -55,3 +57,24 @@ def test_single_block_finite():
     y = decoder_block(params["layers"][0], x, cos, sin, cfg, interpret=True)
     assert y.shape == x.shape
     assert jnp.all(jnp.isfinite(y))
+
+
+@pytest.mark.parametrize("n_heads,n_kv_heads", [(2, 2), (4, 2), (4, 1)])
+def test_gqa_forward(n_heads, n_kv_heads):
+    cfg = _tiny_cfg(n_heads=n_heads, n_kv_heads=n_kv_heads)
+    params = init_params(jax.random.PRNGKey(0), cfg)
+    assert params["layers"][0]["wk"].shape == (cfg.dim, cfg.kv_dim)
+    logits = forward(params, jnp.array([[1, 2, 3, 4, 5]]), cfg, interpret=True)
+    assert logits.shape == (1, 5, cfg.vocab_size)
+    assert jnp.all(jnp.isfinite(logits))
+
+
+@pytest.mark.parametrize("n_heads,n_kv_heads", [(2, 2), (4, 2), (4, 1)])
+def test_cached_matches_recompute(n_heads, n_kv_heads):
+    """KV-cache decoding must produce the same tokens as full recompute."""
+    cfg = _tiny_cfg(n_heads=n_heads, n_kv_heads=n_kv_heads)
+    params = init_params(jax.random.PRNGKey(5), cfg)
+    prompt = jnp.array([[5, 9, 2, 7, 1]])
+    recompute = generate(params, prompt, max_new_tokens=8, cfg=cfg, interpret=True)
+    cached = generate_cached(params, prompt, max_new_tokens=8, cfg=cfg, interpret=True)
+    assert jnp.array_equal(recompute, cached)

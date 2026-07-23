@@ -77,6 +77,24 @@ def swiglu_mlp(x: jax.Array, w_gate: jax.Array, w_up: jax.Array, w_down: jax.Arr
 # --------------------------------------------------------------------------- #
 # Decoder block + full model
 # --------------------------------------------------------------------------- #
+def project_qkv(params: Params, h: jax.Array, cfg: ModelConfig):
+    """Project normed hidden states to head-shaped Q, K, V (pre-RoPE).
+
+    Q gets ``n_heads`` heads; K and V get ``n_kv_heads`` heads (== n_heads for
+    plain MHA, fewer for grouped-query / multi-query attention). Returns arrays
+    shaped ``[batch, heads, seq, head_dim]``.
+    """
+    batch, seq, _ = h.shape
+
+    def split(t: jax.Array, n_heads: int) -> jax.Array:
+        return t.reshape(batch, seq, n_heads, cfg.head_dim).transpose(0, 2, 1, 3)
+
+    q = split(h @ params["wq"], cfg.n_heads)
+    k = split(h @ params["wk"], cfg.n_kv_heads)
+    v = split(h @ params["wv"], cfg.n_kv_heads)
+    return q, k, v
+
+
 def decoder_block(
     params: Params,
     x: jax.Array,
@@ -90,16 +108,9 @@ def decoder_block(
 
     # --- attention ---------------------------------------------------------
     h = rms_norm(x, params["attn_norm"], cfg.rms_norm_eps)
-    q = h @ params["wq"]
-    k = h @ params["wk"]
-    v = h @ params["wv"]
-
-    def to_heads(t: jax.Array) -> jax.Array:
-        return t.reshape(batch, seq, cfg.n_heads, cfg.head_dim).transpose(0, 2, 1, 3)
-
-    q = apply_rope(to_heads(q), cos, sin)
-    k = apply_rope(to_heads(k), cos, sin)
-    v = to_heads(v)
+    q, k, v = project_qkv(params, h, cfg)
+    q = apply_rope(q, cos, sin)
+    k = apply_rope(k, cos, sin)
 
     # Custom Pallas FlashAttention kernel (causal for autoregressive decoding).
     attn = flash_attention(
@@ -150,8 +161,8 @@ def init_params(key: jax.Array, cfg: ModelConfig, dtype=jnp.float32) -> Params:
             "attn_norm": jnp.ones((cfg.dim,), dtype),
             "ffn_norm": jnp.ones((cfg.dim,), dtype),
             "wq": normal(next(keys), (cfg.dim, cfg.dim), proj_scale),
-            "wk": normal(next(keys), (cfg.dim, cfg.dim), proj_scale),
-            "wv": normal(next(keys), (cfg.dim, cfg.dim), proj_scale),
+            "wk": normal(next(keys), (cfg.dim, cfg.kv_dim), proj_scale),
+            "wv": normal(next(keys), (cfg.dim, cfg.kv_dim), proj_scale),
             "wo": normal(next(keys), (cfg.dim, cfg.dim), proj_scale),
             "w_gate": normal(next(keys), (cfg.dim, cfg.ffn_hidden), proj_scale),
             "w_up": normal(next(keys), (cfg.dim, cfg.ffn_hidden), proj_scale),
@@ -178,8 +189,8 @@ def generate(
     """Greedy autoregressive generation.
 
     For clarity this re-runs the causal model over the growing sequence each
-    step (the simplest correct form). A KV-cache would avoid recomputation and
-    is noted as a future extension in the README.
+    step (the simplest correct form). See :func:`generate_cached` for the
+    KV-cache version that avoids recomputing the prefix every step.
 
     Args:
         prompt_ids: int array of shape ``[batch, prompt_len]``.
@@ -193,4 +204,127 @@ def generate(
         logits = forward(params, tokens, cfg, interpret=interpret)
         next_tok = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
         tokens = jnp.concatenate([tokens, next_tok], axis=1)
+    return tokens
+
+
+# --------------------------------------------------------------------------- #
+# KV-cache decoding
+# --------------------------------------------------------------------------- #
+# The generation loop above recomputes the whole prefix at every step -- O(T^2)
+# work to emit T tokens. Real inference caches each layer's K and V so that a
+# decode step only computes the *new* token's query/key/value and attends it
+# against the cache: O(T) projections and a single-row attention per step.
+#
+# We reuse the very same Pallas kernel:
+#   * prefill runs the prompt with ``causal=True`` (queries and keys aligned);
+#   * each decode step attends the single new query against the full cache with
+#     ``causal=False`` -- the new token legitimately sees every cached position.
+Cache = list  # per-layer list of {"k": [b, n_kv, len, d], "v": [b, n_kv, len, d]}
+
+
+def _attend(layer: Params, q, k, v, cfg: ModelConfig, interpret: bool, causal: bool):
+    """Run the Pallas attention and the output projection for one block."""
+    batch, _, seq_q, _ = q.shape
+    attn = flash_attention(
+        q, k, v, causal=causal, block_q=cfg.block_q, block_k=cfg.block_k, interpret=interpret
+    )
+    attn = attn.transpose(0, 2, 1, 3).reshape(batch, seq_q, cfg.dim)
+    return attn @ layer["wo"]
+
+
+def _rope_slice(pos_start: int, length: int, cfg: ModelConfig, dtype):
+    """cos/sin tables for absolute positions ``[pos_start, pos_start+length)``."""
+    cos, sin = precompute_rope(pos_start + length, cfg.head_dim, cfg.rope_theta)
+    return cos[pos_start:].astype(dtype), sin[pos_start:].astype(dtype)
+
+
+def prefill(params: Params, tokens: jax.Array, cfg: ModelConfig, interpret: bool = False):
+    """Run the prompt and build the KV cache.
+
+    Returns ``(logits, cache)`` where ``logits`` has shape
+    ``[batch, prompt_len, vocab_size]`` and ``cache`` holds the post-RoPE K/V of
+    every layer.
+    """
+    seq = tokens.shape[1]
+    x = params["embed"][tokens]
+    cos, sin = _rope_slice(0, seq, cfg, x.dtype)
+
+    cache: Cache = []
+    for layer in params["layers"]:
+        h = rms_norm(x, layer["attn_norm"], cfg.rms_norm_eps)
+        q, k, v = project_qkv(layer, h, cfg)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+        x = x + _attend(layer, q, k, v, cfg, interpret, causal=True)
+        cache.append({"k": k, "v": v})
+        h = rms_norm(x, layer["ffn_norm"], cfg.rms_norm_eps)
+        x = x + swiglu_mlp(h, layer["w_gate"], layer["w_up"], layer["w_down"])
+
+    x = rms_norm(x, params["final_norm"], cfg.rms_norm_eps)
+    return x @ params["lm_head"], cache
+
+
+def decode_step(
+    params: Params,
+    token: jax.Array,
+    cache: Cache,
+    pos: int,
+    cfg: ModelConfig,
+    interpret: bool = False,
+):
+    """Advance generation by one token.
+
+    Args:
+        token: int array of shape ``[batch, 1]`` -- the token at absolute
+            position ``pos``.
+        cache: the KV cache holding positions ``[0, pos)``.
+        pos: absolute position of ``token``.
+
+    Returns ``(logits, new_cache)`` with ``logits`` of shape
+    ``[batch, 1, vocab_size]`` and the cache extended to include ``pos``.
+    """
+    x = params["embed"][token]                       # [b, 1, dim]
+    cos, sin = _rope_slice(pos, 1, cfg, x.dtype)      # RoPE at the new position
+
+    new_cache: Cache = []
+    for layer, layer_cache in zip(params["layers"], cache):
+        h = rms_norm(x, layer["attn_norm"], cfg.rms_norm_eps)
+        q, k, v = project_qkv(layer, h, cfg)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+        k_all = jnp.concatenate([layer_cache["k"], k], axis=2)   # [b, n_kv, pos+1, d]
+        v_all = jnp.concatenate([layer_cache["v"], v], axis=2)
+        # Single new query attends to every cached position -> causal=False.
+        x = x + _attend(layer, q, k_all, v_all, cfg, interpret, causal=False)
+        new_cache.append({"k": k_all, "v": v_all})
+        h = rms_norm(x, layer["ffn_norm"], cfg.rms_norm_eps)
+        x = x + swiglu_mlp(h, layer["w_gate"], layer["w_up"], layer["w_down"])
+
+    x = rms_norm(x, params["final_norm"], cfg.rms_norm_eps)
+    return x @ params["lm_head"], new_cache
+
+
+def generate_cached(
+    params: Params,
+    prompt_ids: jax.Array,
+    max_new_tokens: int,
+    cfg: ModelConfig,
+    interpret: bool = False,
+) -> jax.Array:
+    """Greedy generation using a KV cache.
+
+    Produces the same tokens as :func:`generate` but only computes the new
+    token's attention each step instead of re-running the whole prefix.
+    """
+    batch, prompt_len = prompt_ids.shape
+    logits, cache = prefill(params, prompt_ids, cfg, interpret=interpret)
+    next_tok = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+    tokens = jnp.concatenate([prompt_ids, next_tok], axis=1)
+
+    for i in range(max_new_tokens - 1):
+        pos = prompt_len + i                          # position of next_tok
+        logits, cache = decode_step(params, next_tok, cache, pos, cfg, interpret=interpret)
+        next_tok = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+        tokens = jnp.concatenate([tokens, next_tok], axis=1)
+
     return tokens

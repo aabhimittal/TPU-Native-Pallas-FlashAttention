@@ -41,6 +41,26 @@ def test_matches_reference(shape, causal):
     assert jnp.max(jnp.abs(out - ref)) < 2e-3
 
 
+@pytest.mark.parametrize("n_heads,n_kv_heads", [(8, 2), (8, 1), (4, 4)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_grouped_query_attention(n_heads, n_kv_heads, causal):
+    keys = jax.random.split(jax.random.PRNGKey(7), 3)
+    q = jax.random.normal(keys[0], (1, n_heads, 256, 128), jnp.float32)
+    k = jax.random.normal(keys[1], (1, n_kv_heads, 256, 128), jnp.float32)
+    v = jax.random.normal(keys[2], (1, n_kv_heads, 256, 128), jnp.float32)
+    out = flash_attention(q, k, v, causal=causal, interpret=True)
+    ref = reference_attention(q, k, v, causal=causal)
+    assert out.shape == (1, n_heads, 256, 128)
+    assert jnp.max(jnp.abs(out - ref)) < 2e-3
+
+
+def test_gqa_requires_divisible_heads():
+    q = jnp.zeros((1, 6, 128, 128))
+    k = v = jnp.zeros((1, 4, 128, 128))  # 6 not divisible by 4
+    with pytest.raises(ValueError):
+        flash_attention(q, k, v, interpret=True)
+
+
 @pytest.mark.parametrize("block", [(64, 64), (128, 256), (256, 128)])
 def test_block_sizes(block):
     bq, bk = block
