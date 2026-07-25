@@ -7,6 +7,10 @@ the XLA compiler to fuse a naive attention, we hand-write a kernel that tiles
 Q/K/V, manages the **HBM → VMEM** data movement explicitly, and runs the
 online-softmax algorithm so the full attention matrix is never materialized.
 
+Forward **and** backward are hand-written Pallas kernels, with grouped-query
+attention, a single-query decode kernel over a fixed-size KV cache, and
+bfloat16 support.
+
 ## Why bother?
 
 The default `softmax(Q Kᵀ) V` that XLA compiles materializes the entire
@@ -19,13 +23,14 @@ and peak memory grow roughly **linearly**. The speedup widens as `seq_len` grows
 
 | Path | What it is |
 |------|------------|
-| `src/pallas_flash/flash_attention.py` | The Pallas kernel + `flash_attention()` wrapper (MHA / GQA / MQA) |
+| `src/pallas_flash/flash_attention.py` | The Pallas kernels: forward, backward (`custom_vjp`), and `flash_attention_decode` |
 | `src/pallas_flash/reference.py` | Naive `jnp` attention — correctness oracle **and** XLA baseline |
-| `src/pallas_flash/model.py` | Tiny LLaMA: RMSNorm, RoPE, SwiGLU, decoder block, `generate()`, KV-cache `generate_cached()` |
+| `src/pallas_flash/model.py` | Tiny LLaMA: RMSNorm, RoPE, SwiGLU, decoder block, `generate()`, fixed-cache `generate_cached()` |
 | `src/pallas_flash/config.py` | `ModelConfig` dataclass (incl. `n_kv_heads` for GQA) |
 | `tests/` | `interpret=True` correctness + model smoke tests (run on CPU) |
 | `benchmarks/benchmark_attention.py` | Pallas vs XLA attention timing table |
 | `benchmarks/benchmark_decode.py` | KV-cache vs full-recompute decoding timing table |
+| `benchmarks/benchmark_backward.py` | Forward vs forward+backward timing, Pallas vs XLA |
 | `scripts/run_inference.py` | End-to-end tiny-LLaMA greedy generation demo |
 | `notebooks/kaggle_tpu_flash_attention.ipynb` | Self-contained Kaggle TPU v3-8 notebook |
 
@@ -48,9 +53,42 @@ sequentially in lexicographic order.
    (`num_heads` a multiple of `num_kv_heads`). Query head `h` reads KV head
    `h // (num_heads // num_kv_heads)` — expressed purely in the K/V `BlockSpec`
    index map, so the KV cache is never physically replicated.
+5. **Fixed-size KV cache (`kv_len`).** Only the first `kv_len` positions are
+   attended, and kv blocks starting past it are skipped outright — so cost tracks
+   the *filled* length of a preallocated cache, not its capacity.
+6. **bfloat16.** Inputs are up-cast to float32 inside VMEM, so the online softmax
+   and `p @ v` accumulate in float32 while HBM traffic halves. Outputs come back
+   in the input dtype.
 
 The *same* source runs on CPU via `interpret=True` (used by the tests) and
 compiles to TPU with `interpret=False`.
+
+## Backward pass
+
+`flash_attention` is a `jax.custom_vjp`, so it works with `jax.grad` /
+`jax.value_and_grad` like any JAX function — and its backward pass is **two more
+Pallas kernels**, not an XLA fallback. The forward kernel saves the per-row
+log-sum-exp (a `[batch, heads, seq, 1]` residual), which lets the backward
+recompute `p = exp(s - lse)` tile-by-tile instead of storing the score matrix:
+
+```
+delta_i = Σ_d o_id · do_id           (cheap elementwise "preprocess")
+dv_j    = Σ_i p_ij · do_i
+ds_ij   = p_ij (do_i·v_j − delta_i)
+dq_i    = scale · Σ_j ds_ij · k_j    kernel 1: grid (b, h, q_block, kv_block)
+dk_j    = scale · Σ_i ds_ij · q_i    kernel 2: grid (b, h, kv_block, q_block)
+```
+
+dQ needs an outer loop over query blocks and dK/dV over kv blocks, so they are
+two kernels with transposed grids. For GQA, dK/dV are produced per *query* head
+and the group is summed afterwards, keeping cross-head reductions out of the
+kernel. Gradients match JAX autodiff through the reference attention to ~1e-6
+relative (see `tests/test_backward.py`).
+
+```python
+loss = lambda q, k, v: jnp.sum(flash_attention(q, k, v, causal=True))
+dq, dk, dv = jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+```
 
 ## Quick start
 
@@ -94,9 +132,10 @@ v3-8 the Pallas kernel pulls ahead of the XLA baseline as `seq_len` increases.
 ## KV-cache decoding
 
 `generate()` re-runs the whole prefix every step (O(T²) work to emit T tokens).
-`generate_cached()` keeps a per-layer K/V cache and reuses the *same* Pallas
-kernel — the prompt is processed once with `causal=True` (prefill), then each new
-token attends its single query against the cache with `causal=False`:
+`generate_cached()` allocates a **fixed-capacity** per-layer K/V cache once,
+writes each new token's K/V in place, and calls the dedicated single-query
+`flash_attention_decode` kernel — so there is no per-step reallocation and no
+growing concatenate:
 
 ```python
 from pallas_flash import ModelConfig, init_params, generate_cached
@@ -113,10 +152,11 @@ the test-suite) while doing far less work per step. Benchmark it with
 
 - **Untrained model** — parameters are random; the LLaMA exists to exercise the
   kernel on a realistic inference path, not to produce meaningful text.
-- **Forward only** — no attention backward pass (inference focus).
-- **KV cache** — implemented via `generate_cached()`, which reuses the forward
-  kernel (single-query attention against the cache). A dedicated single-query
-  *decode kernel* with a fixed-size ring-buffer cache is a further optimization.
+- **KV cache** — implemented via `generate_cached()` on a preallocated
+  fixed-capacity cache driven by `flash_attention_decode`. A ring-buffer cache
+  for unbounded-length streaming is a further extension.
+- **Training** — gradients are implemented and tested, but there is no optimizer
+  or training loop here; the model stays randomly initialized.
 - **Fully manual DMA** — `BlockSpec` already pipelines HBM↔VMEM copies; for
   hand-rolled control you can keep K/V in `pltpu.ANY` and drive
   `pltpu.make_async_copy` yourself (sketched in the notebook's notes).

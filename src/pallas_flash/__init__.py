@@ -5,7 +5,7 @@ wired into a tiny LLaMA-style decoder for inference.
 """
 
 from .config import ModelConfig
-from .flash_attention import flash_attention
+from .flash_attention import flash_attention, flash_attention_decode
 from .reference import reference_attention
 from .model import (
     forward,
@@ -13,6 +13,7 @@ from .model import (
     generate_cached,
     prefill,
     decode_step,
+    init_kv_cache,
     init_params,
     decoder_block,
     project_qkv,
@@ -25,12 +26,14 @@ from .model import (
 __all__ = [
     "ModelConfig",
     "flash_attention",
+    "flash_attention_decode",
     "reference_attention",
     "forward",
     "generate",
     "generate_cached",
     "prefill",
     "decode_step",
+    "init_kv_cache",
     "init_params",
     "decoder_block",
     "project_qkv",
