@@ -17,13 +17,13 @@ dependency-light (just JAX + NumPy, no Flax/Haiku).
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import jax
 import jax.numpy as jnp
 
 from .config import ModelConfig
-from .flash_attention import flash_attention
+from .flash_attention import flash_attention, flash_attention_decode
 
 Params = Dict[str, Any]
 
@@ -217,9 +217,14 @@ def generate(
 #
 # We reuse the very same Pallas kernel:
 #   * prefill runs the prompt with ``causal=True`` (queries and keys aligned);
-#   * each decode step attends the single new query against the full cache with
-#     ``causal=False`` -- the new token legitimately sees every cached position.
-Cache = list  # per-layer list of {"k": [b, n_kv, len, d], "v": [b, n_kv, len, d]}
+#   * each decode step attends the single new query against the cache through
+#     ``flash_attention_decode``, which masks and skips everything past the
+#     filled length -- the new token legitimately sees every cached position.
+#
+# The cache is **preallocated** to a fixed capacity and written in place, so the
+# decode loop does no reallocation and the kernel's cost tracks the filled
+# length rather than the capacity.
+Cache = list  # per-layer list of {"k": [b, n_kv, cache_size, d], "v": same}
 
 
 def _attend(layer: Params, q, k, v, cfg: ModelConfig, interpret: bool, causal: bool):
@@ -238,25 +243,60 @@ def _rope_slice(pos_start: int, length: int, cfg: ModelConfig, dtype):
     return cos[pos_start:].astype(dtype), sin[pos_start:].astype(dtype)
 
 
-def prefill(params: Params, tokens: jax.Array, cfg: ModelConfig, interpret: bool = False):
+def init_kv_cache(
+    cfg: ModelConfig, batch: int, cache_size: int, dtype=jnp.float32
+) -> Cache:
+    """Allocate an empty fixed-size KV cache for every layer."""
+    shape = (batch, cfg.n_kv_heads, cache_size, cfg.head_dim)
+    return [
+        {"k": jnp.zeros(shape, dtype), "v": jnp.zeros(shape, dtype)}
+        for _ in range(cfg.n_layers)
+    ]
+
+
+def _cache_write(layer_cache: dict, k, v, start: int) -> dict:
+    """Write ``k``/``v`` (length L) into the cache at ``[start, start+L)``."""
+    return {
+        "k": jax.lax.dynamic_update_slice_in_dim(layer_cache["k"], k, start, 2),
+        "v": jax.lax.dynamic_update_slice_in_dim(layer_cache["v"], v, start, 2),
+    }
+
+
+def prefill(
+    params: Params,
+    tokens: jax.Array,
+    cfg: ModelConfig,
+    interpret: bool = False,
+    cache_size: Optional[int] = None,
+):
     """Run the prompt and build the KV cache.
+
+    Args:
+        tokens: int array of shape ``[batch, prompt_len]``.
+        cache_size: capacity of the preallocated cache. Defaults to
+            ``cfg.max_seq_len``; must be at least ``prompt_len``.
 
     Returns ``(logits, cache)`` where ``logits`` has shape
     ``[batch, prompt_len, vocab_size]`` and ``cache`` holds the post-RoPE K/V of
-    every layer.
+    every layer in fixed-capacity buffers.
     """
-    seq = tokens.shape[1]
+    batch, seq = tokens.shape
+    if cache_size is None:
+        cache_size = cfg.max_seq_len
+    if cache_size < seq:
+        raise ValueError(f"cache_size ({cache_size}) must be >= prompt length ({seq})")
+
     x = params["embed"][tokens]
     cos, sin = _rope_slice(0, seq, cfg, x.dtype)
 
-    cache: Cache = []
-    for layer in params["layers"]:
+    cache = init_kv_cache(cfg, batch, cache_size, x.dtype)
+    for idx, layer in enumerate(params["layers"]):
         h = rms_norm(x, layer["attn_norm"], cfg.rms_norm_eps)
         q, k, v = project_qkv(layer, h, cfg)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         x = x + _attend(layer, q, k, v, cfg, interpret, causal=True)
-        cache.append({"k": k, "v": v})
+        cache[idx] = _cache_write(cache[idx], k, v, 0)
         h = rms_norm(x, layer["ffn_norm"], cfg.rms_norm_eps)
         x = x + swiglu_mlp(h, layer["w_gate"], layer["w_up"], layer["w_down"])
 
@@ -274,6 +314,9 @@ def decode_step(
 ):
     """Advance generation by one token.
 
+    The new token's K/V are written into the cache at slot ``pos`` and the
+    single-query decode kernel attends over slots ``[0, pos]``.
+
     Args:
         token: int array of shape ``[batch, 1]`` -- the token at absolute
             position ``pos``.
@@ -283,6 +326,10 @@ def decode_step(
     Returns ``(logits, new_cache)`` with ``logits`` of shape
     ``[batch, 1, vocab_size]`` and the cache extended to include ``pos``.
     """
+    cache_size = cache[0]["k"].shape[2]
+    if pos >= cache_size:
+        raise ValueError(f"position {pos} exceeds cache capacity {cache_size}")
+
     x = params["embed"][token]                       # [b, 1, dim]
     cos, sin = _rope_slice(pos, 1, cfg, x.dtype)      # RoPE at the new position
 
@@ -292,11 +339,16 @@ def decode_step(
         q, k, v = project_qkv(layer, h, cfg)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        k_all = jnp.concatenate([layer_cache["k"], k], axis=2)   # [b, n_kv, pos+1, d]
-        v_all = jnp.concatenate([layer_cache["v"], v], axis=2)
-        # Single new query attends to every cached position -> causal=False.
-        x = x + _attend(layer, q, k_all, v_all, cfg, interpret, causal=False)
-        new_cache.append({"k": k_all, "v": v_all})
+        layer_cache = _cache_write(layer_cache, k, v, pos)
+        # Single new query attends slots [0, pos] of the fixed-size cache.
+        attn = flash_attention_decode(
+            q, layer_cache["k"], layer_cache["v"], pos + 1,
+            block_k=cfg.block_k, interpret=interpret,
+        )
+        batch = x.shape[0]
+        attn = attn.transpose(0, 2, 1, 3).reshape(batch, 1, cfg.dim)
+        x = x + attn @ layer["wo"]
+        new_cache.append(layer_cache)
         h = rms_norm(x, layer["ffn_norm"], cfg.rms_norm_eps)
         x = x + swiglu_mlp(h, layer["w_gate"], layer["w_up"], layer["w_down"])
 
@@ -311,13 +363,17 @@ def generate_cached(
     cfg: ModelConfig,
     interpret: bool = False,
 ) -> jax.Array:
-    """Greedy generation using a KV cache.
+    """Greedy generation using a fixed-size KV cache.
 
     Produces the same tokens as :func:`generate` but only computes the new
-    token's attention each step instead of re-running the whole prefix.
+    token's attention each step instead of re-running the whole prefix. The
+    cache is allocated once, up front, to exactly the length this call needs.
     """
     batch, prompt_len = prompt_ids.shape
-    logits, cache = prefill(params, prompt_ids, cfg, interpret=interpret)
+    cache_size = prompt_len + max_new_tokens
+    logits, cache = prefill(
+        params, prompt_ids, cfg, interpret=interpret, cache_size=cache_size
+    )
     next_tok = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
     tokens = jnp.concatenate([prompt_ids, next_tok], axis=1)
 
