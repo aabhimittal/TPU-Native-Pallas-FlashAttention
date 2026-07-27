@@ -384,3 +384,148 @@ def generate_cached(
         tokens = jnp.concatenate([tokens, next_tok], axis=1)
 
     return tokens
+
+
+# --------------------------------------------------------------------------- #
+# Ring-buffer cache (unbounded streaming / sliding-window attention)
+# --------------------------------------------------------------------------- #
+# The fixed-size cache above still needs capacity == total sequence length, so
+# it cannot stream forever. A **ring buffer** of capacity C keeps only the most
+# recent C tokens: the token at absolute position ``pos`` is written to slot
+# ``pos % C``, overwriting the token from C steps ago. Generation can then run
+# indefinitely in constant memory (sliding-window attention).
+#
+# Two facts make this work with the existing kernel and no extra masking:
+#   1. RoPE is applied *before* the K/V go into the cache, so every cached entry
+#      already carries its absolute position.
+#   2. Attention is permutation-invariant over the key axis, so the fact that
+#      the ring stores positions out of order is irrelevant.
+# Once the ring has wrapped, every slot is live and ``kv_len`` is simply C.
+
+
+def init_ring_cache(cfg: ModelConfig, batch: int, capacity: int, dtype=jnp.float32) -> Cache:
+    """Allocate a ring-buffer KV cache holding the most recent ``capacity`` tokens."""
+    return init_kv_cache(cfg, batch, capacity, dtype)
+
+
+def ring_kv_len(total_tokens: int, capacity: int) -> int:
+    """Number of live slots after ``total_tokens`` have been written."""
+    return min(total_tokens, capacity)
+
+
+def prefill_ring(
+    params: Params,
+    tokens: jax.Array,
+    cfg: ModelConfig,
+    capacity: int,
+    interpret: bool = False,
+):
+    """Prefill into a ring cache, retaining only the last ``capacity`` tokens.
+
+    The prompt itself is attended in full (ordinary causal attention); only what
+    is *kept* for subsequent decoding is limited to the window.
+
+    Returns ``(logits, cache)``.
+    """
+    batch, seq = tokens.shape
+    x = params["embed"][tokens]
+    cos, sin = _rope_slice(0, seq, cfg, x.dtype)
+
+    keep = min(seq, capacity)
+    start = seq - keep
+    # Absolute positions start..seq-1 land in these ring slots (may wrap).
+    slots = (jnp.arange(start, seq) % capacity)
+
+    cache = init_ring_cache(cfg, batch, capacity, x.dtype)
+    for idx, layer in enumerate(params["layers"]):
+        h = rms_norm(x, layer["attn_norm"], cfg.rms_norm_eps)
+        q, k, v = project_qkv(layer, h, cfg)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+        x = x + _attend(layer, q, k, v, cfg, interpret, causal=True)
+        cache[idx] = {
+            "k": cache[idx]["k"].at[:, :, slots].set(k[:, :, start:]),
+            "v": cache[idx]["v"].at[:, :, slots].set(v[:, :, start:]),
+        }
+        h = rms_norm(x, layer["ffn_norm"], cfg.rms_norm_eps)
+        x = x + swiglu_mlp(h, layer["w_gate"], layer["w_up"], layer["w_down"])
+
+    x = rms_norm(x, params["final_norm"], cfg.rms_norm_eps)
+    return x @ params["lm_head"], cache
+
+
+def ring_decode_step(
+    params: Params,
+    token: jax.Array,
+    cache: Cache,
+    pos: int,
+    cfg: ModelConfig,
+    interpret: bool = False,
+):
+    """One decode step against a ring cache.
+
+    Writes the new token's K/V to slot ``pos % capacity`` and attends over the
+    live window.
+
+    Args:
+        token: ``[batch, 1]`` int array -- the token at absolute position ``pos``.
+        pos: absolute position of ``token`` (may exceed the ring capacity).
+    """
+    capacity = cache[0]["k"].shape[2]
+    slot = pos % capacity
+    kv_len = ring_kv_len(pos + 1, capacity)
+
+    x = params["embed"][token]
+    cos, sin = _rope_slice(pos, 1, cfg, x.dtype)   # RoPE at the *absolute* position
+
+    new_cache: Cache = []
+    for layer, layer_cache in zip(params["layers"], cache):
+        h = rms_norm(x, layer["attn_norm"], cfg.rms_norm_eps)
+        q, k, v = project_qkv(layer, h, cfg)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+        layer_cache = _cache_write(layer_cache, k, v, slot)
+        attn = flash_attention_decode(
+            q, layer_cache["k"], layer_cache["v"], kv_len,
+            block_k=cfg.block_k, interpret=interpret,
+        )
+        batch = x.shape[0]
+        attn = attn.transpose(0, 2, 1, 3).reshape(batch, 1, cfg.dim)
+        x = x + attn @ layer["wo"]
+        new_cache.append(layer_cache)
+        h = rms_norm(x, layer["ffn_norm"], cfg.rms_norm_eps)
+        x = x + swiglu_mlp(h, layer["w_gate"], layer["w_up"], layer["w_down"])
+
+    x = rms_norm(x, params["final_norm"], cfg.rms_norm_eps)
+    return x @ params["lm_head"], new_cache
+
+
+def generate_streaming(
+    params: Params,
+    prompt_ids: jax.Array,
+    max_new_tokens: int,
+    cfg: ModelConfig,
+    window: int,
+    interpret: bool = False,
+) -> jax.Array:
+    """Greedy generation in **constant memory** using a ring-buffer cache.
+
+    Each token attends the most recent ``window`` positions, so the cache never
+    grows and generation can continue indefinitely. When
+    ``window >= prompt_len + max_new_tokens`` nothing is ever evicted and this
+    matches :func:`generate_cached` exactly.
+    """
+    batch, prompt_len = prompt_ids.shape
+    logits, cache = prefill_ring(params, prompt_ids, cfg, window, interpret=interpret)
+    next_tok = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+    tokens = jnp.concatenate([prompt_ids, next_tok], axis=1)
+
+    for i in range(max_new_tokens - 1):
+        pos = prompt_len + i
+        logits, cache = ring_decode_step(
+            params, next_tok, cache, pos, cfg, interpret=interpret
+        )
+        next_tok = jnp.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+        tokens = jnp.concatenate([tokens, next_tok], axis=1)
+
+    return tokens
